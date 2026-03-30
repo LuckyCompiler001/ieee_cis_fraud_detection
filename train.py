@@ -6,16 +6,23 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
-
+import shutil
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split
+
+from data_process import (
+    load_and_merge_tables,
+    preprocess_features,
+    restrict_to_naive_features,
+    time_based_validation_split,
+)
+from prober import log_round_metrics
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -25,138 +32,72 @@ logger = logging.getLogger(__name__)
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = SCRIPT_DIR / 'data'
 OUTPUT_DIR = SCRIPT_DIR / 'result'
+PROBER_DIR = SCRIPT_DIR / 'prober_result'
 
 RANDOM_STATE = 42
-N_ESTIMATORS = 6000
-LEARNING_RATE = 0.001
-NUM_LEAVES = 4
-MAX_DEPTH = 3
-MIN_CHILD_SAMPLES = 512
+DEFAULT_N_ESTIMATORS = 6000
+DEFAULT_LEARNING_RATE = 0.001
+DEFAULT_NUM_LEAVES = 4
+DEFAULT_MAX_DEPTH = 3
+DEFAULT_MIN_CHILD_SAMPLES = 512
+DEFAULT_SUBSAMPLE = 0.5
+DEFAULT_COLSAMPLE_BYTREE = 0.2
+DEFAULT_REG_ALPHA = 5.0
+DEFAULT_REG_LAMBDA = 10.0
 N_JOBS = -1
 VALID_TIME_QUANTILE = 0.8
-NAIVE_FEATURES = ['TransactionDT', 'TransactionAmt']
+NAIVE_FEATURES = ['TransactionAmt']
+# potential_improvement_1: surface these defaults via a config file or Aim experiment tracker so sweeps are reproducible.
 LOG_EVAL_PERIOD = 500
+MAX_TRAIN_ROWS = 5000
 
 
-def load_and_merge_tables(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    logger.info('Loading transaction and identity tables ...')
-    train_transaction = pd.read_csv(data_dir / 'train_transaction.csv')
-    test_transaction = pd.read_csv(data_dir / 'test_transaction.csv')
-    train_identity = pd.read_csv(data_dir / 'train_identity.csv')
-    test_identity = pd.read_csv(data_dir / 'test_identity.csv')
-
-    logger.info('Merging train tables on TransactionID ...')
-    train_merged = train_transaction.merge(train_identity, on='TransactionID', how='left')
-
-    logger.info('Merging test tables on TransactionID ...')
-    test_merged = test_transaction.merge(test_identity, on='TransactionID', how='left')
-
-    return train_merged, test_merged
-
-
-def encode_categorical_columns(
-    train_frame: pd.DataFrame,
-    test_frame: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    all_columns = sorted(set(train_frame.columns) | set(test_frame.columns))
-    train_frame = train_frame.reindex(columns=all_columns)
-    test_frame = test_frame.reindex(columns=all_columns)
-
-    categorical_columns = [
-        column
-        for column in all_columns
-        if pd.api.types.is_object_dtype(train_frame[column].dtype)
-        or pd.api.types.is_string_dtype(train_frame[column].dtype)
-        or isinstance(train_frame[column].dtype, pd.CategoricalDtype)
-        or pd.api.types.is_object_dtype(test_frame[column].dtype)
-        or pd.api.types.is_string_dtype(test_frame[column].dtype)
-        or isinstance(test_frame[column].dtype, pd.CategoricalDtype)
-    ]
-
-    logger.info('Encoding %d categorical columns ...', len(categorical_columns))
-    for column in categorical_columns:
-        combined = pd.concat([train_frame[column], test_frame[column]], axis=0)
-        combined = combined.astype('string').fillna('__MISSING__')
-
-        codes, _ = pd.factorize(combined, sort=False)
-        train_frame[column] = codes[: len(train_frame)].astype(np.int32)
-        test_frame[column] = codes[len(train_frame) :].astype(np.int32)
-
-    return train_frame, test_frame
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='Train LightGBM baseline with naive settings.')
+    parser.add_argument(
+        '--round-index',
+        default='0',
+        help='Identifier used for saving prober outputs and train version snapshots.',
+    )
+    parser.add_argument('--n-estimators', type=int, default=DEFAULT_N_ESTIMATORS, help='Number of boosting rounds.')
+    parser.add_argument('--learning-rate', type=float, default=DEFAULT_LEARNING_RATE, help='Learning rate for boosting.')
+    parser.add_argument('--num-leaves', type=int, default=DEFAULT_NUM_LEAVES, help='Maximum number of leaves per tree.')
+    parser.add_argument('--max-depth', type=int, default=DEFAULT_MAX_DEPTH, help='Maximum tree depth (-1 for unlimited).')
+    parser.add_argument('--min-child-samples', type=int, default=DEFAULT_MIN_CHILD_SAMPLES, help='Minimum data points per leaf.')
+    parser.add_argument('--subsample', type=float, default=DEFAULT_SUBSAMPLE, help='Row subsampling fraction.')
+    parser.add_argument('--colsample-bytree', type=float, default=DEFAULT_COLSAMPLE_BYTREE, help='Column subsampling fraction.')
+    parser.add_argument('--reg-alpha', type=float, default=DEFAULT_REG_ALPHA, help='L1 regularization term.')
+    parser.add_argument('--reg-lambda', type=float, default=DEFAULT_REG_LAMBDA, help='L2 regularization term.')
+    # potential_improvement_2: expose additional knobs (feature groups, truncation size, validation split) or load from a YAML/CLI profile for quicker iteration.
+    return parser.parse_args()
 
 
-def preprocess_features(
-    train_frame: pd.DataFrame,
-    test_frame: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    train_copy = train_frame.copy()
-    test_copy = test_frame.copy()
-
-    train_copy, test_copy = encode_categorical_columns(train_copy, test_copy)
-
-    train_copy = train_copy.replace([np.inf, -np.inf], np.nan).fillna(-999)
-    test_copy = test_copy.replace([np.inf, -np.inf], np.nan).fillna(-999)
-
-    for column in train_copy.columns:
-        if pd.api.types.is_float_dtype(train_copy[column]):
-            train_copy[column] = train_copy[column].astype(np.float32)
-            test_copy[column] = test_copy[column].astype(np.float32)
-        elif pd.api.types.is_integer_dtype(train_copy[column]):
-            train_copy[column] = train_copy[column].astype(np.int32)
-            test_copy[column] = test_copy[column].astype(np.int32)
-
-    return train_copy, test_copy
+def save_train_version(round_index: str) -> Path:
+    PROBER_DIR.mkdir(parents=True, exist_ok=True)
+    version_path = PROBER_DIR / f'train_version_{round_index}.py'
+    shutil.copy2(SCRIPT_DIR / 'train.py', version_path)
+    logger.info('Saved train snapshot to %s', version_path)
+    # potential_improvement_3: capture a git commit hash or diff instead of copying the whole script to reduce clutter and ensure reproducibility.
+    return version_path
 
 
-def restrict_to_naive_features(
-    train_frame: pd.DataFrame,
-    test_frame: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    naive_columns = [column for column in NAIVE_FEATURES if column in train_frame.columns]
-    if not naive_columns:
-        numeric_columns = train_frame.select_dtypes(include=[np.number]).columns.tolist()
-        naive_columns = numeric_columns[:1] if numeric_columns else [train_frame.columns[0]]
-
-    logger.info('Restricting to naive feature set: %s', ', '.join(naive_columns))
-
-    train_simple = train_frame.loc[:, naive_columns].copy()
-    test_simple = test_frame.loc[:, naive_columns].copy()
-
-    for column in naive_columns:
-        train_simple[column] = (train_simple[column] % 5).astype(np.float32)
-        test_simple[column] = (test_simple[column] % 5).astype(np.float32)
-
-    return train_simple, test_simple
-
-
-def time_based_validation_split(
+def truncate_training_rows(
     features: pd.DataFrame,
     target: pd.Series,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, float]:
-    time_threshold = float(features['TransactionDT'].quantile(VALID_TIME_QUANTILE))
-    train_mask = features['TransactionDT'] <= time_threshold
-    valid_mask = features['TransactionDT'] > time_threshold
+    max_rows: int,
+) -> tuple[pd.DataFrame, pd.Series]:
+    if max_rows <= 0 or len(features) <= max_rows:
+        return features, target
 
-    if valid_mask.sum() == 0 or train_mask.sum() == 0:
-        logger.warning('Time split failed (empty side), falling back to stratified random split.')
-        X_train, X_valid, y_train, y_valid = train_test_split(
-            features,
-            target,
-            test_size=0.2,
-            random_state=RANDOM_STATE,
-            stratify=target,
-        )
-        return X_train, X_valid, y_train, y_valid, float('nan')
-
-    X_train = features.loc[train_mask].copy()
-    y_train = target.loc[train_mask].copy()
-    X_valid = features.loc[valid_mask].copy()
-    y_valid = target.loc[valid_mask].copy()
-
-    return X_train, X_valid, y_train, y_valid, time_threshold
+    logger.info('Truncating training data to the first %d rows for naive baseline.', max_rows)
+    limited_features = features.iloc[:max_rows].copy()
+    limited_target = target.iloc[:max_rows].copy()
+    # potential_improvement_4: sample rows stratified by target or TransactionDT to avoid time leakage while still limiting volume.
+    return limited_features, limited_target
 
 
-def train() -> None:
+def train(args: argparse.Namespace) -> None:
+    round_index = str(args.round_index)
     try:
         import lightgbm as lgb
     except ModuleNotFoundError as exc:
@@ -168,6 +109,7 @@ def train() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     train_merged, test_merged = load_and_merge_tables(DATA_DIR)
+    # potential_improvement_5: preload cached/parquet versions of the merged datasets to avoid repeated heavy CSV parsing.
 
     y = train_merged['isFraud'].astype(int)
     test_ids = test_merged['TransactionID'].copy()
@@ -177,30 +119,45 @@ def train() -> None:
 
     logger.info('Preprocessing features ...')
     train_features, test_features = preprocess_features(train_features, test_features)
-    train_features, test_features = restrict_to_naive_features(train_features, test_features)
+    train_features, test_features = restrict_to_naive_features(
+        train_features,
+        test_features,
+        NAIVE_FEATURES,
+        modulo=3,
+    )
+    # potential_improvement_6: retain richer engineered features or configurable feature groups so model iterations can improve beyond this naive subset.
 
     X = train_features.drop(columns=['TransactionID'], errors='ignore')
     X_test = test_features.drop(columns=['TransactionID'], errors='ignore')
 
-    X_train, X_valid, y_train, y_valid, time_threshold = time_based_validation_split(X, y)
+    X, y = truncate_training_rows(X, y, MAX_TRAIN_ROWS)
+
+    X_train, X_valid, y_train, y_valid, time_threshold = time_based_validation_split(
+        X,
+        y,
+        VALID_TIME_QUANTILE,
+        RANDOM_STATE,
+    )
+    # potential_improvement_7: support cross-validation folds or repeated temporal splits to get more stable validation metrics.
 
     logger.info('Training naive LightGBM baseline ...')
     model = lgb.LGBMClassifier(
         objective='binary',
         metric='auc',
-        n_estimators=N_ESTIMATORS,
-        learning_rate=LEARNING_RATE,
-        num_leaves=NUM_LEAVES,
-        max_depth=MAX_DEPTH,
-        min_child_samples=MIN_CHILD_SAMPLES,
-        subsample=0.5,
+        n_estimators=args.n_estimators,
+        learning_rate=args.learning_rate,
+        num_leaves=args.num_leaves,
+        max_depth=args.max_depth,
+        min_child_samples=args.min_child_samples,
+        subsample=args.subsample,
         subsample_freq=1,
-        colsample_bytree=0.2,
-        reg_alpha=5.0,
-        reg_lambda=10.0,
+        colsample_bytree=args.colsample_bytree,
+        reg_alpha=args.reg_alpha,
+        reg_lambda=args.reg_lambda,
         random_state=RANDOM_STATE,
         n_jobs=N_JOBS,
     )
+    # potential_improvement_8: tune LightGBM hyperparameters (class weights, regularization, learning schedule) programmatically or via optuna to boost AUROC.
 
     model.fit(
         X_train,
@@ -209,6 +166,7 @@ def train() -> None:
         eval_metric='auc',
         callbacks=[lgb.log_evaluation(LOG_EVAL_PERIOD)],
     )
+    # potential_improvement_9: add early stopping and custom callbacks (e.g., Aim tracking) so bad runs terminate sooner and diagnostics are richer.
 
     val_pred = model.predict_proba(X_valid)[:, 1]
     val_auc = float(roc_auc_score(y_valid, val_pred))
@@ -238,10 +196,13 @@ def train() -> None:
         'best_iteration': int(model.best_iteration_ or 0),
         'time_split_quantile': VALID_TIME_QUANTILE,
         'time_split_threshold': time_threshold,
+        'round_index': round_index,
     }
     metrics_path = OUTPUT_DIR / 'validation_metrics.json'
     with metrics_path.open('w', encoding='utf-8') as handle:
         json.dump(metrics, handle, indent=2)
+    # potential_improvement_10: enrich saved metrics with additional diagnostics (loss curves, feature stats, inference timing) for deeper analysis.
+    log_round_metrics(PROBER_DIR, round_index, metrics)
 
     feature_importance = pd.DataFrame(
         {
@@ -259,7 +220,10 @@ def train() -> None:
 
 
 def main() -> None:
-    train()
+    args = parse_args()
+    round_index = str(args.round_index)
+    save_train_version(round_index)
+    train(args)
 
 
 if __name__ == '__main__':
