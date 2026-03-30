@@ -27,11 +27,15 @@ DATA_DIR = SCRIPT_DIR / 'data'
 OUTPUT_DIR = SCRIPT_DIR / 'result'
 
 RANDOM_STATE = 42
-N_ESTIMATORS = 2000
-LEARNING_RATE = 0.03
-NUM_LEAVES = 64
+N_ESTIMATORS = 6000
+LEARNING_RATE = 0.001
+NUM_LEAVES = 4
+MAX_DEPTH = 3
+MIN_CHILD_SAMPLES = 512
 N_JOBS = -1
 VALID_TIME_QUANTILE = 0.8
+NAIVE_FEATURES = ['TransactionDT', 'TransactionAmt']
+LOG_EVAL_PERIOD = 500
 
 
 def load_and_merge_tables(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -104,6 +108,27 @@ def preprocess_features(
     return train_copy, test_copy
 
 
+def restrict_to_naive_features(
+    train_frame: pd.DataFrame,
+    test_frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    naive_columns = [column for column in NAIVE_FEATURES if column in train_frame.columns]
+    if not naive_columns:
+        numeric_columns = train_frame.select_dtypes(include=[np.number]).columns.tolist()
+        naive_columns = numeric_columns[:1] if numeric_columns else [train_frame.columns[0]]
+
+    logger.info('Restricting to naive feature set: %s', ', '.join(naive_columns))
+
+    train_simple = train_frame.loc[:, naive_columns].copy()
+    test_simple = test_frame.loc[:, naive_columns].copy()
+
+    for column in naive_columns:
+        train_simple[column] = (train_simple[column] % 5).astype(np.float32)
+        test_simple[column] = (test_simple[column] % 5).astype(np.float32)
+
+    return train_simple, test_simple
+
+
 def time_based_validation_split(
     features: pd.DataFrame,
     target: pd.Series,
@@ -152,30 +177,29 @@ def train() -> None:
 
     logger.info('Preprocessing features ...')
     train_features, test_features = preprocess_features(train_features, test_features)
+    train_features, test_features = restrict_to_naive_features(train_features, test_features)
 
     X = train_features.drop(columns=['TransactionID'], errors='ignore')
     X_test = test_features.drop(columns=['TransactionID'], errors='ignore')
 
     X_train, X_valid, y_train, y_valid, time_threshold = time_based_validation_split(X, y)
 
-    pos_count = int(y_train.sum())
-    neg_count = int((1 - y_train).sum())
-    scale_pos_weight = neg_count / max(pos_count, 1)
-
-    logger.info('Training LightGBM baseline ...')
+    logger.info('Training naive LightGBM baseline ...')
     model = lgb.LGBMClassifier(
         objective='binary',
         metric='auc',
         n_estimators=N_ESTIMATORS,
         learning_rate=LEARNING_RATE,
         num_leaves=NUM_LEAVES,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=1.0,
+        max_depth=MAX_DEPTH,
+        min_child_samples=MIN_CHILD_SAMPLES,
+        subsample=0.5,
+        subsample_freq=1,
+        colsample_bytree=0.2,
+        reg_alpha=5.0,
+        reg_lambda=10.0,
         random_state=RANDOM_STATE,
         n_jobs=N_JOBS,
-        scale_pos_weight=scale_pos_weight,
     )
 
     model.fit(
@@ -183,7 +207,7 @@ def train() -> None:
         y_train,
         eval_set=[(X_valid, y_valid)],
         eval_metric='auc',
-        callbacks=[lgb.early_stopping(200, first_metric_only=True), lgb.log_evaluation(100)],
+        callbacks=[lgb.log_evaluation(LOG_EVAL_PERIOD)],
     )
 
     val_pred = model.predict_proba(X_valid)[:, 1]
