@@ -1,0 +1,16 @@
+{
+  "metric": "roc_auc",
+  "value": 0.9206107479203357,
+  "n_features": 479,
+  "n_train_rows": 472432,
+  "n_valid_rows": 118108,
+  "best_iteration": 3008,
+  "bagging_rounds": 1,
+  "bagging_seed_step": 13,
+  "refit_full": false,
+  "refit_iterations": 0,
+  "refit_train_rows": 0,
+  "time_split_quantile": 0.8,
+  "time_split_threshold": 12192853.600000001,
+  "round_index": "5"
+}

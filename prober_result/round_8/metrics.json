@@ -1,0 +1,22 @@
+{
+  "metric": "roc_auc",
+  "value": 0.9261860238809608,
+  "n_features": 704,
+  "n_train_rows": 472432,
+  "n_valid_rows": 118108,
+  "best_iteration": 3112,
+  "bagging_rounds": 1,
+  "bagging_seed_step": 13,
+  "refit_full": false,
+  "refit_iterations": 0,
+  "refit_train_rows": 0,
+  "probability_calibration": false,
+  "best_threshold": null,
+  "best_threshold_metric": null,
+  "best_threshold_score": null,
+  "variance_threshold": 0.0,
+  "dropped_low_variance_columns": [],
+  "time_split_quantile": 0.8,
+  "time_split_threshold": 12192853.600000001,
+  "round_index": "8"
+}

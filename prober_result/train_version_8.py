@@ -136,12 +136,6 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help='Drop numeric features whose variance falls below this threshold (0 disables).',
     )
-    parser.add_argument(
-        '--correlation-threshold',
-        type=float,
-        default=0.0,
-        help='Drop numeric features that are too correlated (absolute Pearson correlation above this value).',
-    )
    
     return parser.parse_args()
 
@@ -333,48 +327,6 @@ def engineer_group_statistics(
     return train_copy, test_copy
 
 
-def engineer_interaction_features(
-    train_frame: pd.DataFrame,
-    test_frame: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Create lightweight interaction terms between numeric signals."""
-
-    train_copy = train_frame.copy()
-    test_copy = test_frame.copy()
-
-    if 'TransactionAmt' in train_copy.columns:
-        amt = train_copy['TransactionAmt'].astype('float32')
-        amt_test = test_copy['TransactionAmt'].astype('float32')
-        freq_candidates = [
-            column
-            for column in ('card1_freq', 'card2_freq', 'addr1_freq')
-            if column in train_copy.columns and column in test_copy.columns
-        ]
-        for freq_column in freq_candidates:
-            freq_train = train_copy[freq_column].astype('float32')
-            freq_test = test_copy[freq_column].astype('float32')
-            train_copy[f'TransactionAmt_x_{freq_column}'] = amt * freq_train
-            test_copy[f'TransactionAmt_x_{freq_column}'] = amt_test * freq_test
-            train_copy[f'TransactionAmt_div_{freq_column}'] = amt / (freq_train + 1.0)
-            test_copy[f'TransactionAmt_div_{freq_column}'] = amt_test / (freq_test + 1.0)
-
-        if 'TransactionDT_norm' in train_copy.columns and 'TransactionDT_norm' in test_copy.columns:
-            dt_train = train_copy['TransactionDT_norm'].astype('float32')
-            dt_test = test_copy['TransactionDT_norm'].astype('float32')
-            train_copy['TransactionAmt_x_TransactionDT_norm'] = amt * dt_train
-            test_copy['TransactionAmt_x_TransactionDT_norm'] = amt_test * dt_test
-
-    if 'TransactionDT_rank' in train_copy.columns and 'card1_freq' in train_copy.columns:
-        train_copy['TransactionDT_rank_x_card1_freq'] = (
-            train_copy['TransactionDT_rank'].astype('float32') * train_copy['card1_freq'].astype('float32')
-        )
-        test_copy['TransactionDT_rank_x_card1_freq'] = (
-            test_copy['TransactionDT_rank'].astype('float32') * test_copy['card1_freq'].astype('float32')
-        )
-
-    return train_copy, test_copy
-
-
 def engineer_missing_indicators(
     train_frame: pd.DataFrame,
     test_frame: pd.DataFrame,
@@ -427,38 +379,6 @@ def apply_variance_threshold(
     return filtered_train, filtered_test, low_variance_columns
 
 
-def apply_correlation_threshold(
-    train_frame: pd.DataFrame,
-    test_frame: pd.DataFrame,
-    threshold: float,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    """Drop highly correlated columns to reduce redundancy."""
-
-    if threshold <= 0.0 or threshold >= 1.0:
-        return train_frame, test_frame, []
-    numeric_train = train_frame.select_dtypes(include=[np.number])
-    if numeric_train.empty:
-        return train_frame, test_frame, []
-
-    corr_matrix = numeric_train.corr(method='pearson').abs()
-    upper_mask = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
-    upper = corr_matrix.where(upper_mask)
-    to_drop = [column for column in upper.columns if (upper[column] > threshold).any()]
-    if not to_drop:
-        return train_frame, test_frame, []
-
-    logger.info(
-        'Dropping %d highly correlated feature(s) above threshold %.4f.',
-        len(to_drop),
-        threshold,
-    )
-
-    filtered_train = train_frame.drop(columns=to_drop, errors='ignore')
-    filtered_test = test_frame.drop(columns=to_drop, errors='ignore')
-
-    return filtered_train, filtered_test, to_drop
-
-
 def train(args: argparse.Namespace) -> None:
     round_index = str(args.round_index)
     try:
@@ -507,8 +427,6 @@ def train(args: argparse.Namespace) -> None:
     # potential_improvement17 (addressed): aggregate TransactionAmt statistics per grouping key to expose customer spending behavior.
     train_features, test_features = engineer_missing_indicators(train_features, test_features)
     # potential_improvement18 (addressed): add binary missing-value indicators so the model can learn from absence patterns.
-    train_features, test_features = engineer_interaction_features(train_features, test_features)
-    # potential_improvement19 (addressed): inject key interaction terms to capture non-linear relationships between engineered signals.
     
     X = train_features.drop(columns=['TransactionID', 'TransactionDT'], errors='ignore')
     X_test = test_features.drop(columns=['TransactionID', 'TransactionDT'], errors='ignore')
@@ -519,10 +437,6 @@ def train(args: argparse.Namespace) -> None:
     variance_threshold = max(0.0, float(args.variance_threshold))
     X, X_test, dropped_low_variance_columns = apply_variance_threshold(X, X_test, variance_threshold)
     # potential_improvement16 (addressed): remove near-constant signals using a variance threshold to reduce noise and overfitting.
-
-    correlation_threshold = min(max(0.0, float(args.correlation_threshold)), 0.999)
-    X, X_test, dropped_correlated_columns = apply_correlation_threshold(X, X_test, correlation_threshold)
-    # potential_improvement20 (addressed): prune highly correlated features to reduce redundancy and improve generalization.
 
     max_train_rows = max(0, int(args.max_train_rows))
     X, y = truncate_training_rows(X, y, max_train_rows)
@@ -724,8 +638,6 @@ def train(args: argparse.Namespace) -> None:
         'best_threshold_score': best_threshold_score,
         'variance_threshold': variance_threshold,
         'dropped_low_variance_columns': dropped_low_variance_columns,
-        'correlation_threshold': correlation_threshold,
-        'dropped_correlated_columns': dropped_correlated_columns,
         'time_split_quantile': valid_time_quantile,
         'time_split_threshold': time_threshold,
         'round_index': round_index,

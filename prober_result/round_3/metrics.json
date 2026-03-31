@@ -1,0 +1,11 @@
+{
+  "metric": "roc_auc",
+  "value": 0.8405151780674098,
+  "n_features": 479,
+  "n_train_rows": 472432,
+  "n_valid_rows": 118108,
+  "best_iteration": 0,
+  "time_split_quantile": 0.8,
+  "time_split_threshold": 12192853.600000001,
+  "round_index": "3"
+}

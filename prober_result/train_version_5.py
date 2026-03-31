@@ -15,8 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score, roc_auc_score
+from sklearn.metrics import roc_auc_score
 
 from data_process import (
     load_and_merge_tables,
@@ -119,28 +118,6 @@ def parse_args() -> argparse.Namespace:
         '--refit-full',
         action='store_true',
         help='After validation, refit a final model on train+valid using the averaged best iteration.',
-    )
-    parser.add_argument(
-        '--calibrate-probabilities',
-        action='store_true',
-        help='Apply Platt scaling on validation predictions before exporting test probabilities.',
-    )
-    parser.add_argument(
-        '--optimize-threshold',
-        action='store_true',
-        help='Search for a validation decision threshold (F1-based) for downstream use.',
-    )
-    parser.add_argument(
-        '--variance-threshold',
-        type=float,
-        default=0.0,
-        help='Drop numeric features whose variance falls below this threshold (0 disables).',
-    )
-    parser.add_argument(
-        '--correlation-threshold',
-        type=float,
-        default=0.0,
-        help='Drop numeric features that are too correlated (absolute Pearson correlation above this value).',
     )
    
     return parser.parse_args()
@@ -247,218 +224,6 @@ def engineer_temporal_features(
     return train_copy, test_copy
 
 
-def engineer_frequency_features(
-    train_frame: pd.DataFrame,
-    test_frame: pd.DataFrame,
-    freq_columns: list[str] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Add simple frequency encodings for selected categorical columns."""
-
-    if freq_columns is None:
-        freq_columns = ['card1', 'card2', 'addr1', 'ProductCD', 'P_emaildomain']
-
-    train_copy = train_frame.copy()
-    test_copy = test_frame.copy()
-
-    combined = pd.concat([train_copy, test_copy], axis=0, ignore_index=True)
-    for column in freq_columns:
-        if column not in train_copy.columns or column not in test_copy.columns:
-            continue
-
-        counts = combined[column].value_counts(dropna=False)
-        train_copy[f'{column}_freq'] = train_copy[column].map(counts).fillna(0).astype(np.float32)
-        test_copy[f'{column}_freq'] = test_copy[column].map(counts).fillna(0).astype(np.float32)
-
-    return train_copy, test_copy
-
-
-def engineer_group_statistics(
-    train_frame: pd.DataFrame,
-    test_frame: pd.DataFrame,
-    group_columns: list[str] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Add aggregated TransactionAmt statistics per grouping key."""
-
-    if 'TransactionAmt' not in train_frame.columns:
-        return train_frame, test_frame
-
-    if group_columns is None:
-        group_columns = ['card1', 'card2', 'addr1', 'P_emaildomain', 'R_emaildomain']
-
-    train_copy = train_frame.copy()
-    test_copy = test_frame.copy()
-    train_amt = train_copy['TransactionAmt'].astype('float32')
-    global_mean = float(train_amt.mean())
-    global_std = float(train_amt.std())
-    global_median = float(train_amt.median())
-
-    for column in group_columns:
-        if column not in train_copy.columns or column not in test_copy.columns:
-            continue
-
-        grouped_stats = train_copy.groupby(column)['TransactionAmt'].agg(['mean', 'std', 'median', 'count'])
-        mean_map = grouped_stats['mean']
-        std_map = grouped_stats['std'].fillna(0.0)
-        median_map = grouped_stats['median']
-        count_map = grouped_stats['count']
-
-        train_copy[f'TransactionAmt_{column}_mean'] = (
-            train_copy[column].map(mean_map).fillna(global_mean).astype('float32')
-        )
-        test_copy[f'TransactionAmt_{column}_mean'] = (
-            test_copy[column].map(mean_map).fillna(global_mean).astype('float32')
-        )
-
-        train_copy[f'TransactionAmt_{column}_std'] = (
-            train_copy[column].map(std_map).fillna(global_std).astype('float32')
-        )
-        test_copy[f'TransactionAmt_{column}_std'] = (
-            test_copy[column].map(std_map).fillna(global_std).astype('float32')
-        )
-
-        train_copy[f'TransactionAmt_{column}_median'] = (
-            train_copy[column].map(median_map).fillna(global_median).astype('float32')
-        )
-        test_copy[f'TransactionAmt_{column}_median'] = (
-            test_copy[column].map(median_map).fillna(global_median).astype('float32')
-        )
-
-        train_copy[f'{column}_TransactionAmt_count'] = (
-            train_copy[column].map(count_map).fillna(0).astype('float32')
-        )
-        test_copy[f'{column}_TransactionAmt_count'] = (
-            test_copy[column].map(count_map).fillna(0).astype('float32')
-        )
-
-    return train_copy, test_copy
-
-
-def engineer_interaction_features(
-    train_frame: pd.DataFrame,
-    test_frame: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Create lightweight interaction terms between numeric signals."""
-
-    train_copy = train_frame.copy()
-    test_copy = test_frame.copy()
-
-    if 'TransactionAmt' in train_copy.columns:
-        amt = train_copy['TransactionAmt'].astype('float32')
-        amt_test = test_copy['TransactionAmt'].astype('float32')
-        freq_candidates = [
-            column
-            for column in ('card1_freq', 'card2_freq', 'addr1_freq')
-            if column in train_copy.columns and column in test_copy.columns
-        ]
-        for freq_column in freq_candidates:
-            freq_train = train_copy[freq_column].astype('float32')
-            freq_test = test_copy[freq_column].astype('float32')
-            train_copy[f'TransactionAmt_x_{freq_column}'] = amt * freq_train
-            test_copy[f'TransactionAmt_x_{freq_column}'] = amt_test * freq_test
-            train_copy[f'TransactionAmt_div_{freq_column}'] = amt / (freq_train + 1.0)
-            test_copy[f'TransactionAmt_div_{freq_column}'] = amt_test / (freq_test + 1.0)
-
-        if 'TransactionDT_norm' in train_copy.columns and 'TransactionDT_norm' in test_copy.columns:
-            dt_train = train_copy['TransactionDT_norm'].astype('float32')
-            dt_test = test_copy['TransactionDT_norm'].astype('float32')
-            train_copy['TransactionAmt_x_TransactionDT_norm'] = amt * dt_train
-            test_copy['TransactionAmt_x_TransactionDT_norm'] = amt_test * dt_test
-
-    if 'TransactionDT_rank' in train_copy.columns and 'card1_freq' in train_copy.columns:
-        train_copy['TransactionDT_rank_x_card1_freq'] = (
-            train_copy['TransactionDT_rank'].astype('float32') * train_copy['card1_freq'].astype('float32')
-        )
-        test_copy['TransactionDT_rank_x_card1_freq'] = (
-            test_copy['TransactionDT_rank'].astype('float32') * test_copy['card1_freq'].astype('float32')
-        )
-
-    return train_copy, test_copy
-
-
-def engineer_missing_indicators(
-    train_frame: pd.DataFrame,
-    test_frame: pd.DataFrame,
-    sentinel: float = -999.0,
-    max_indicator_columns: int = 200,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Append binary columns denoting whether the value was originally missing."""
-
-    train_copy = train_frame.copy()
-    test_copy = test_frame.copy()
-
-    candidate_columns = [
-        column
-        for column in train_copy.columns
-        if (train_copy[column] == sentinel).any() or (test_copy[column] == sentinel).any()
-    ]
-    if max_indicator_columns > 0 and len(candidate_columns) > max_indicator_columns:
-        candidate_columns = candidate_columns[:max_indicator_columns]
-
-    for column in candidate_columns:
-        train_copy[f'{column}_is_missing'] = (train_copy[column] == sentinel).astype(np.int8)
-        test_copy[f'{column}_is_missing'] = (test_copy[column] == sentinel).astype(np.int8)
-
-    return train_copy, test_copy
-
-
-def apply_variance_threshold(
-    train_frame: pd.DataFrame,
-    test_frame: pd.DataFrame,
-    threshold: float,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    """Drop columns whose variance falls below the requested threshold."""
-
-    if threshold <= 0.0:
-        return train_frame, test_frame, []
-
-    variances = train_frame.var(axis=0, numeric_only=True)
-    low_variance_columns = variances[variances < threshold].index.tolist()
-    if not low_variance_columns:
-        return train_frame, test_frame, []
-
-    logger.info(
-        'Dropping %d low-variance feature(s) below threshold %.6f.',
-        len(low_variance_columns),
-        threshold,
-    )
-    filtered_train = train_frame.drop(columns=low_variance_columns, errors='ignore')
-    filtered_test = test_frame.drop(columns=low_variance_columns, errors='ignore')
-
-    return filtered_train, filtered_test, low_variance_columns
-
-
-def apply_correlation_threshold(
-    train_frame: pd.DataFrame,
-    test_frame: pd.DataFrame,
-    threshold: float,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    """Drop highly correlated columns to reduce redundancy."""
-
-    if threshold <= 0.0 or threshold >= 1.0:
-        return train_frame, test_frame, []
-    numeric_train = train_frame.select_dtypes(include=[np.number])
-    if numeric_train.empty:
-        return train_frame, test_frame, []
-
-    corr_matrix = numeric_train.corr(method='pearson').abs()
-    upper_mask = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
-    upper = corr_matrix.where(upper_mask)
-    to_drop = [column for column in upper.columns if (upper[column] > threshold).any()]
-    if not to_drop:
-        return train_frame, test_frame, []
-
-    logger.info(
-        'Dropping %d highly correlated feature(s) above threshold %.4f.',
-        len(to_drop),
-        threshold,
-    )
-
-    filtered_train = train_frame.drop(columns=to_drop, errors='ignore')
-    filtered_test = test_frame.drop(columns=to_drop, errors='ignore')
-
-    return filtered_train, filtered_test, to_drop
-
-
 def train(args: argparse.Namespace) -> None:
     round_index = str(args.round_index)
     try:
@@ -501,28 +266,12 @@ def train(args: argparse.Namespace) -> None:
     # potential_improvement5 (addressed): use the full engineered feature space (and avoid coarse modulo hashing) to retain discriminative transaction signals.
     train_features, test_features = engineer_simple_features(train_features, test_features)
     train_features, test_features = engineer_temporal_features(train_features, test_features)
-    train_features, test_features = engineer_frequency_features(train_features, test_features)
-    # potential_improvement15 (addressed): append frequency encodings for key categorical fields to capture prevalence trends.
-    train_features, test_features = engineer_group_statistics(train_features, test_features)
-    # potential_improvement17 (addressed): aggregate TransactionAmt statistics per grouping key to expose customer spending behavior.
-    train_features, test_features = engineer_missing_indicators(train_features, test_features)
-    # potential_improvement18 (addressed): add binary missing-value indicators so the model can learn from absence patterns.
-    train_features, test_features = engineer_interaction_features(train_features, test_features)
-    # potential_improvement19 (addressed): inject key interaction terms to capture non-linear relationships between engineered signals.
     
     X = train_features.drop(columns=['TransactionID', 'TransactionDT'], errors='ignore')
     X_test = test_features.drop(columns=['TransactionID', 'TransactionDT'], errors='ignore')
     X = X.astype('float32')
     X_test = X_test.astype('float32')
     # potential_improvement6 (addressed): keep high-precision continuous values or normalized variants instead of rounding everything to whole numbers.
-
-    variance_threshold = max(0.0, float(args.variance_threshold))
-    X, X_test, dropped_low_variance_columns = apply_variance_threshold(X, X_test, variance_threshold)
-    # potential_improvement16 (addressed): remove near-constant signals using a variance threshold to reduce noise and overfitting.
-
-    correlation_threshold = min(max(0.0, float(args.correlation_threshold)), 0.999)
-    X, X_test, dropped_correlated_columns = apply_correlation_threshold(X, X_test, correlation_threshold)
-    # potential_improvement20 (addressed): prune highly correlated features to reduce redundancy and improve generalization.
 
     max_train_rows = max(0, int(args.max_train_rows))
     X, y = truncate_training_rows(X, y, max_train_rows)
@@ -619,37 +368,6 @@ def train(args: argparse.Namespace) -> None:
 
     val_pred = val_pred_accum / n_bagging_models
     test_pred = test_pred_accum / n_bagging_models
-
-    calibration_model: LogisticRegression | None = None
-    if args.calibrate_probabilities:
-        calibration_model = LogisticRegression(max_iter=1000, solver='lbfgs')
-        calibration_model.fit(val_pred.reshape(-1, 1), y_valid.values)
-        val_pred = calibration_model.predict_proba(val_pred.reshape(-1, 1))[:, 1]
-        test_pred = calibration_model.predict_proba(test_pred.reshape(-1, 1))[:, 1]
-        logger.info('Applied Platt scaling calibration on validation predictions.')
-        # potential_improvement13 (addressed): calibrate predicted probabilities before generating submissions.
-
-    best_threshold = None
-    best_threshold_metric = None
-    best_threshold_score = None
-    if args.optimize_threshold:
-        threshold_grid = np.linspace(0.05, 0.95, 181)
-        best_threshold = 0.5
-        best_threshold_metric = 'f1'
-        best_threshold_score = -1.0
-        for threshold in threshold_grid:
-            threshold_pred = (val_pred >= threshold).astype(int)
-            threshold_score = f1_score(y_valid, threshold_pred)
-            if threshold_score > best_threshold_score:
-                best_threshold = float(threshold)
-                best_threshold_score = float(threshold_score)
-        logger.info(
-            'Optimized validation threshold %.4f with F1 score %.4f.',
-            best_threshold,
-            best_threshold_score,
-        )
-        # potential_improvement14 (addressed): tune a downstream classification threshold using validation predictions.
-
     val_auc = float(roc_auc_score(y_valid, val_pred))
     logger.info('Averaged validation ROC-AUC: %.6f', val_auc)
 
@@ -718,14 +436,6 @@ def train(args: argparse.Namespace) -> None:
         'refit_full': bool(args.refit_full),
         'refit_iterations': int(refit_iterations),
         'refit_train_rows': int(refit_train_rows),
-        'probability_calibration': bool(args.calibrate_probabilities),
-        'best_threshold': best_threshold,
-        'best_threshold_metric': best_threshold_metric,
-        'best_threshold_score': best_threshold_score,
-        'variance_threshold': variance_threshold,
-        'dropped_low_variance_columns': dropped_low_variance_columns,
-        'correlation_threshold': correlation_threshold,
-        'dropped_correlated_columns': dropped_correlated_columns,
         'time_split_quantile': valid_time_quantile,
         'time_split_threshold': time_threshold,
         'round_index': round_index,
